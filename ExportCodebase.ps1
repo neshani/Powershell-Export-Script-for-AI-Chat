@@ -1,0 +1,277 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Configuration
+$targetDirectory = $PSScriptRoot
+$fileSetsPath = Join-Path -Path $targetDirectory -ChildPath "file-sets.txt"
+
+# Base Excluded Folders (will be combined with .gitignore)
+$baseExclude = @(
+    '__pycache__', 'venv', 'tts_cache', 'XTTS-v2', 'node_modules',
+    '.git', 'audio_previews', '.vscode', '.idea', '.gradle', '.kotlin'
+)
+
+# A script-level flag to prevent recursive events when programmatically checking boxes
+$script:isUpdatingChecks = $false
+
+#region Helper Functions
+function Get-SafeFileContent {
+    [CmdletBinding()]
+    param ([Parameter(Mandatory = $true)][string]$FilePath)
+    try { return Get-Content -Path $FilePath -Raw -ErrorAction Stop }
+    catch {
+        Write-Warning "Error reading file '$FilePath': $($_.Exception.Message)"
+        return "ERROR READING FILE: $($_.Exception.Message)"
+    }
+}
+function Get-FileSet {
+    [CmdletBinding()]
+    param ([Parameter(Mandatory = $true)][string]$FilePath)
+    $fileSets = [ordered]@{}
+    if (Test-Path -Path $FilePath) {
+        $lines = Get-Content -Path $FilePath
+        $currentSetName = $null
+        foreach ($line in $lines) {
+            if ($line.StartsWith("[")) {
+                $currentSetName = $line.Trim("[]")
+                $fileSets[$currentSetName] = @()
+            }
+            elseif ($currentSetName -and $line.Trim() -ne "") {
+                $fileSets[$currentSetName] += $line.Trim()
+            }
+        }
+    }
+    return $fileSets
+}
+function Set-FileSet {
+    [CmdletBinding()]
+    param ([Parameter(Mandatory = $true)][string]$FilePath, [Parameter(Mandatory = $true)][hashtable]$FileSets)
+    $content = ""
+    foreach ($setName in $FileSets.Keys) {
+        $content += "[$setName]`r`n"
+        $FileSets[$setName] | ForEach-Object { $content += "$_`r`n" }
+        $content += "`r`n"
+    }
+    $content | Out-File -FilePath $FilePath -Encoding utf8
+}
+
+# Function to get a combined exclusion list from base list and .gitignore
+function Get-ExclusionList {
+    param (
+        [string]$RootPath,
+        [string[]]$BaseExclusions
+    )
+    $combinedExclusions = [System.Collections.Generic.List[string]]::new()
+    $combinedExclusions.AddRange($BaseExclusions)
+
+    $gitignorePath = Join-Path -Path $RootPath -ChildPath ".gitignore"
+    if (Test-Path -Path $gitignorePath) {
+        try {
+            $gitignorePatterns = [string[]](Get-Content -Path $gitignorePath -ErrorAction Stop | ForEach-Object {
+                $line = $_.Trim()
+                if ($line -and !$line.StartsWith("#")) {
+                    $line.TrimStart("/").TrimEnd("/")
+                }
+            } | Where-Object { $_ })
+
+            if ($gitignorePatterns) {
+                $combinedExclusions.AddRange($gitignorePatterns)
+            }
+        } catch {
+            Write-Warning "Could not read .gitignore file at '$gitignorePath': $($_.Exception.Message)"
+        }
+    }
+    return $combinedExclusions | Select-Object -Unique
+}
+#endregion
+
+#region TreeView Functions
+
+function Add-TreeViewNodes {
+    param($nodes, $path, $rootPath, [string[]]$exclusionList)
+    # Use the passed exclusion list
+    Get-ChildItem -Path $path -Directory | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
+        $dirNode = New-Object System.Windows.Forms.TreeNode($_.Name); $dirNode.Tag = $_.FullName; $nodes.Add($dirNode)
+        Add-TreeViewNodes -nodes $dirNode.Nodes -path $_.FullName -rootPath $rootPath -exclusionList $exclusionList
+    }
+    Get-ChildItem -Path $path -File | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
+        $fileNode = New-Object System.Windows.Forms.TreeNode($_.Name)
+        $fileNode.Tag = $_.FullName -ireplace [regex]::Escape($rootPath), ""
+        $nodes.Add($fileNode)
+    }
+}
+
+function Get-CheckedNodes {
+    param([Parameter(Mandatory=$true)]$nodes)
+    $checkedFiles = [System.Collections.Generic.List[string]]::new()
+    foreach ($node in $nodes) {
+        if ($node.Checked -and $node.Nodes.Count -eq 0) { $checkedFiles.Add($node.Tag) }
+        if ($node.Nodes.Count -gt 0) {
+            $childResults = [string[]](Get-CheckedNodes -nodes $node.Nodes)
+            if ($null -ne $childResults -and $childResults.Count -gt 0) { $checkedFiles.AddRange($childResults) }
+        }
+    }
+    return $checkedFiles
+}
+function Update-TreeViewChecks {
+    param ($nodes, [string[]]$filesToCheck)
+    foreach ($node in $nodes) {
+        if ($node.Nodes.Count -eq 0) { $node.Checked = $filesToCheck -contains $node.Tag }
+        if ($node.Nodes.Count -gt 0) { Update-TreeViewChecks -nodes $node.Nodes -filesToCheck $filesToCheck }
+    }
+}
+function Set-ChildNodeChecks {
+    param ($node, [bool]$isChecked)
+    foreach ($childNode in $node.Nodes) {
+        $childNode.Checked = $isChecked
+        if ($childNode.Nodes.Count -gt 0) { Set-ChildNodeChecks -node $childNode -isChecked $isChecked }
+    }
+}
+function Find-NodeByTag {
+    param(
+        [Parameter(Mandatory=$true)] $nodes, 
+        [Parameter(Mandatory=$true)] [string]$tagToFind
+    )
+    foreach ($node in $nodes) {
+        if ($node.Tag -eq $tagToFind) { return $node }
+        if ($node.Nodes.Count -gt 0) {
+            $found = Find-NodeByTag -nodes $node.Nodes -tagToFind $tagToFind
+            if ($null -ne $found) { return $found }
+        }
+    }
+    return $null
+}
+
+# Function to generate a text-based tree from TreeView nodes
+function Get-TextTree {
+    param (
+        [Parameter(Mandatory=$true)]
+        [System.Windows.Forms.TreeNodeCollection]$nodes,
+        [string]$indent = ""
+    )
+
+    $nodeCount = $nodes.Count
+    for ($i = 0; $i -lt $nodeCount; $i++) {
+        $node = $nodes[$i]
+        $isLast = ($i -eq ($nodeCount - 1))
+        
+        $marker = ""
+        $childIndent = ""
+
+        if ($isLast) {
+            $marker = "L-- "
+            $childIndent = $indent + "    "
+        } else {
+            $marker = "+-- "
+            $childIndent = $indent + "|   "
+        }
+        "$indent$marker$($node.Text)"
+
+        if ($node.Nodes.Count -gt 0) {
+            Get-TextTree -nodes $node.Nodes -indent $childIndent
+        }
+    }
+}
+#endregion
+
+# Main Script
+$finalExcludeList = Get-ExclusionList -RootPath $targetDirectory -BaseExclusions $baseExclude
+
+$fileSets = Get-FileSet -FilePath $fileSetsPath
+$normalizedTargetDirectory = ($targetDirectory -replace '[\\/]$') + [System.IO.Path]::DirectorySeparatorChar
+
+# --- UI Creation ---
+$form = New-Object System.Windows.Forms.Form; $form.Text = "File and Folder Selection"; $form.Size = New-Object System.Drawing.Size(600, 700); $form.StartPosition = "CenterScreen"; $form.MinimumSize = New-Object System.Drawing.Size(450, 400)
+$treeView = New-Object System.Windows.Forms.TreeView; $treeView.Location = New-Object System.Drawing.Point(20, 80); $treeView.Size = New-Object System.Drawing.Size(540, 450); $treeView.CheckBoxes = $true; $treeView.Anchor = 'Top, Bottom, Left, Right'; $form.Controls.Add($treeView)
+$fileSetComboBox = New-Object System.Windows.Forms.ComboBox; $fileSetComboBox.Location = New-Object System.Drawing.Point(20, 20); $fileSetComboBox.Size = New-Object System.Drawing.Size(200, 20); $fileSetComboBox.DropDownStyle = "DropDownList"; $fileSetComboBox.Items.AddRange($fileSets.Keys); $form.Controls.Add($fileSetComboBox)
+$loadFileSetButton = New-Object System.Windows.Forms.Button;$loadFileSetButton.Location = New-Object System.Drawing.Point(230, 20);$loadFileSetButton.Size = New-Object System.Drawing.Size(100, 23);$loadFileSetButton.Text = "Load Set";$form.Controls.Add($loadFileSetButton)
+$fileSetNameTextBox = New-Object System.Windows.Forms.TextBox;$fileSetNameTextBox.Location = New-Object System.Drawing.Point(20, 50);$fileSetNameTextBox.Size = New-Object System.Drawing.Size(200, 20);$form.Controls.Add($fileSetNameTextBox)
+$saveFileSetButton = New-Object System.Windows.Forms.Button;$saveFileSetButton.Location = New-Object System.Drawing.Point(230, 50);$saveFileSetButton.Size = New-Object System.Drawing.Size(100, 23);$saveFileSetButton.Text = "Save Set";$form.Controls.Add($saveFileSetButton)
+$submitButton = New-Object System.Windows.Forms.Button;$submitButton.Location = New-Object System.Drawing.Point(20, 550);$submitButton.Size = New-Object System.Drawing.Size(100, 30);$submitButton.Text = "Export";$submitButton.Anchor = 'Bottom, Left';$form.Controls.Add($submitButton)
+$statusLabel = New-Object System.Windows.Forms.Label;$statusLabel.Location = New-Object System.Drawing.Point(20, 585);$statusLabel.Size = New-Object System.Drawing.Size(540, 20);$statusLabel.Anchor = 'Bottom, Left';$form.Controls.Add($statusLabel)
+
+# Checkbox for adding the project tree
+$addTreeViewCheckbox = New-Object System.Windows.Forms.CheckBox; $addTreeViewCheckbox.Location = New-Object System.Drawing.Point(130, 555); $addTreeViewCheckbox.Size = New-Object System.Drawing.Size(200, 23); $addTreeViewCheckbox.Text = "Add project tree to output"; $addTreeViewCheckbox.Checked = $true; $addTreeViewCheckbox.Anchor = 'Bottom, Left'; $form.Controls.Add($addTreeViewCheckbox)
+
+$statusLabel.Text = "Loading file tree (respecting .gitignore)..."; $form.Update()
+# Pass the final exclusion list to the population function
+Add-TreeViewNodes -nodes $treeView.Nodes -path $targetDirectory -rootPath $normalizedTargetDirectory -exclusionList $finalExcludeList
+$statusLabel.Text = "Ready. Select files or load a set."
+
+# Event Handlers
+$treeView.Add_AfterCheck({param($s, $e)
+    if ($script:isUpdatingChecks) { return }
+    $script:isUpdatingChecks = $true
+    if ($e.Node.Nodes.Count -gt 0) { Set-ChildNodeChecks -node $e.Node -isChecked $e.Node.Checked }
+    $script:isUpdatingChecks = $false
+})
+$loadFileSetButton.Add_Click({
+    $selectedSetName = $fileSetComboBox.SelectedItem
+    if ($selectedSetName) {
+        $filesToLoad = @($fileSets[$selectedSetName]) 
+        
+        $script:isUpdatingChecks = $true
+        Update-TreeViewChecks -nodes $treeView.Nodes -filesToCheck $filesToLoad
+        $script:isUpdatingChecks = $false
+
+        $treeView.BeginUpdate()
+        try {
+            $firstNodeFound = $null
+            foreach ($file in $filesToLoad) {
+                $fileNode = Find-NodeByTag -nodes $treeView.Nodes -tagToFind $file
+                if ($null -ne $fileNode) {
+                    if ($null -eq $firstNodeFound) { $firstNodeFound = $fileNode }
+                    $parentNode = $fileNode.Parent
+                    while ($null -ne $parentNode) {
+                        $parentNode.Expand()
+                        $parentNode = $parentNode.Parent
+                    }
+                }
+            }
+            if ($null -ne $firstNodeFound) { $firstNodeFound.EnsureVisible() }
+        } finally { $treeView.EndUpdate() }
+
+        $statusLabel.Text = "Loaded set '$selectedSetName'."
+    }
+})
+$saveFileSetButton.Add_Click({
+    $setName = $fileSetNameTextBox.Text.Trim()
+    if ($setName) {
+        $selectedFiles = Get-CheckedNodes -nodes $treeView.Nodes
+        $fileSets[$setName] = $selectedFiles
+        Set-FileSet -FilePath $fileSetsPath -FileSets $fileSets
+        $fileSetComboBox.Items.Clear(); $fileSetComboBox.Items.AddRange($fileSets.Keys); $fileSetComboBox.SelectedItem = $setName
+        $statusLabel.Text = "File Set '$setName' Saved."
+    } else { $statusLabel.Text = "Enter a File Set Name." }
+})
+$submitButton.Add_Click({
+    $selectedRelativePaths = Get-CheckedNodes -nodes $treeView.Nodes
+    if ($selectedRelativePaths.Count -eq 0) { $statusLabel.Text = "No files were selected."; return }
+    $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog; $saveFileDialog.Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*"; $saveFileDialog.Title = "Save Combined File Contents"; $saveFileDialog.FileName = "combined_output.txt"
+    if ($saveFileDialog.ShowDialog() -eq "OK") {
+        $outputFilePath = $saveFileDialog.FileName
+        $statusLabel.Text = "Processing..."; $form.Update()
+        $outputLines = [System.Collections.Generic.List[string]]::new()
+
+        if ($addTreeViewCheckbox.Checked) {
+            $outputLines.Add("--- PROJECT TREE ---")
+            $outputLines.Add(".")
+
+            $treeBodyLines = [string[]](Get-TextTree -nodes $treeView.Nodes)
+            
+            if ($treeBodyLines) {
+                $outputLines.AddRange($treeBodyLines)
+            }
+            $outputLines.Add("") 
+        }
+
+        foreach ($relativePath in $selectedRelativePaths) {
+            $fullPath = Join-Path -Path $targetDirectory -ChildPath $relativePath
+            $outputLines.Add("---------"); $outputLines.Add($relativePath); $outputLines.Add((Get-SafeFileContent -FilePath $fullPath))
+        }
+        [System.IO.File]::WriteAllLines($outputFilePath, $outputLines)
+        $statusLabel.Text = "Output saved to: $outputFilePath"
+    } else { $statusLabel.Text = "Operation cancelled." }
+})
+
+[void]$form.ShowDialog()
