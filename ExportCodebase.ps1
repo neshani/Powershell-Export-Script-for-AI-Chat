@@ -18,7 +18,7 @@ $script:isUpdatingChecks = $false
 function Get-SafeFileContent {
     [CmdletBinding()]
     param ([Parameter(Mandatory = $true)][string]$FilePath)
-    try { return Get-Content -Path $FilePath -Raw -ErrorAction Stop }
+    try { return Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop }
     catch {
         Write-Warning "Error reading file '$FilePath': $($_.Exception.Message)"
         return "ERROR READING FILE: $($_.Exception.Message)"
@@ -55,7 +55,7 @@ function Set-FileSet {
     $content | Out-File -FilePath $FilePath -Encoding utf8
 }
 
-# Function to get a combined exclusion list from base list and .gitignore
+# --- NEW: Function to get a combined exclusion list from base list and .gitignore ---
 function Get-ExclusionList {
     param (
         [string]$RootPath,
@@ -67,6 +67,9 @@ function Get-ExclusionList {
     $gitignorePath = Join-Path -Path $RootPath -ChildPath ".gitignore"
     if (Test-Path -Path $gitignorePath) {
         try {
+            # --- THIS IS THE FIX ---
+            # We explicitly cast the entire pipeline result to [string[]]
+            # to ensure the correct type is passed to AddRange.
             $gitignorePatterns = [string[]](Get-Content -Path $gitignorePath -ErrorAction Stop | ForEach-Object {
                 $line = $_.Trim()
                 if ($line -and !$line.StartsWith("#")) {
@@ -88,13 +91,13 @@ function Get-ExclusionList {
 #region TreeView Functions
 
 function Add-TreeViewNodes {
-    param($nodes, $path, $rootPath, [string[]]$exclusionList)
+    param($nodes, $path, $rootPath, [string[]]$exclusionList) # <-- MODIFIED: Added parameter
     # Use the passed exclusion list
-    Get-ChildItem -Path $path -Directory | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
+    Get-ChildItem -LiteralPath $path -Directory | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
         $dirNode = New-Object System.Windows.Forms.TreeNode($_.Name); $dirNode.Tag = $_.FullName; $nodes.Add($dirNode)
         Add-TreeViewNodes -nodes $dirNode.Nodes -path $_.FullName -rootPath $rootPath -exclusionList $exclusionList
     }
-    Get-ChildItem -Path $path -File | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
+    Get-ChildItem -LiteralPath $path -File | Where-Object { $exclusionList -notcontains $_.Name } | ForEach-Object {
         $fileNode = New-Object System.Windows.Forms.TreeNode($_.Name)
         $fileNode.Tag = $_.FullName -ireplace [regex]::Escape($rootPath), ""
         $nodes.Add($fileNode)
@@ -142,7 +145,7 @@ function Find-NodeByTag {
     return $null
 }
 
-# Function to generate a text-based tree from TreeView nodes
+# --- NEW: Function to generate a text-based tree from TreeView nodes ---
 function Get-TextTree {
     param (
         [Parameter(Mandatory=$true)]
@@ -165,16 +168,22 @@ function Get-TextTree {
             $marker = "+-- "
             $childIndent = $indent + "|   "
         }
+        
+        # This is the key: directly output the formatted string for the current node.
+        # PowerShell will collect all these strings into an array.
         "$indent$marker$($node.Text)"
 
         if ($node.Nodes.Count -gt 0) {
+            # Now, recursively call the function. Its output (more strings) will also
+            # be automatically collected and passed up the call stack.
             Get-TextTree -nodes $node.Nodes -indent $childIndent
         }
     }
 }
 #endregion
 
-# Main Script
+# --- Main Script ---
+# --- MODIFIED: Ingest .gitignore to build the final exclusion list ---
 $finalExcludeList = Get-ExclusionList -RootPath $targetDirectory -BaseExclusions $baseExclude
 
 $fileSets = Get-FileSet -FilePath $fileSetsPath
@@ -190,15 +199,15 @@ $saveFileSetButton = New-Object System.Windows.Forms.Button;$saveFileSetButton.L
 $submitButton = New-Object System.Windows.Forms.Button;$submitButton.Location = New-Object System.Drawing.Point(20, 550);$submitButton.Size = New-Object System.Drawing.Size(100, 30);$submitButton.Text = "Export";$submitButton.Anchor = 'Bottom, Left';$form.Controls.Add($submitButton)
 $statusLabel = New-Object System.Windows.Forms.Label;$statusLabel.Location = New-Object System.Drawing.Point(20, 585);$statusLabel.Size = New-Object System.Drawing.Size(540, 20);$statusLabel.Anchor = 'Bottom, Left';$form.Controls.Add($statusLabel)
 
-# Checkbox for adding the project tree
+# --- NEW: Checkbox for adding the project tree ---
 $addTreeViewCheckbox = New-Object System.Windows.Forms.CheckBox; $addTreeViewCheckbox.Location = New-Object System.Drawing.Point(130, 555); $addTreeViewCheckbox.Size = New-Object System.Drawing.Size(200, 23); $addTreeViewCheckbox.Text = "Add project tree to output"; $addTreeViewCheckbox.Checked = $true; $addTreeViewCheckbox.Anchor = 'Bottom, Left'; $form.Controls.Add($addTreeViewCheckbox)
 
 $statusLabel.Text = "Loading file tree (respecting .gitignore)..."; $form.Update()
-# Pass the final exclusion list to the population function
+# --- MODIFIED: Pass the final exclusion list to the population function ---
 Add-TreeViewNodes -nodes $treeView.Nodes -path $targetDirectory -rootPath $normalizedTargetDirectory -exclusionList $finalExcludeList
 $statusLabel.Text = "Ready. Select files or load a set."
 
-# Event Handlers
+# --- Event Handlers ---
 $treeView.Add_AfterCheck({param($s, $e)
     if ($script:isUpdatingChecks) { return }
     $script:isUpdatingChecks = $true
@@ -257,6 +266,9 @@ $submitButton.Add_Click({
             $outputLines.Add("--- PROJECT TREE ---")
             $outputLines.Add(".")
 
+            # --- THIS IS THE FIX ---
+            # Explicitly cast the function's output to [string[]] before using it.
+            # This satisfies the strict type requirement of the .AddRange() method.
             $treeBodyLines = [string[]](Get-TextTree -nodes $treeView.Nodes)
             
             if ($treeBodyLines) {
