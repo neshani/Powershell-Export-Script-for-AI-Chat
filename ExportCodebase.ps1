@@ -282,6 +282,7 @@ $submitButton.Add_Click({
             $outputLines.Add("---------"); $outputLines.Add($relativePath); $outputLines.Add((Get-SafeFileContent -FilePath $fullPath))
         }
         [System.IO.File]::WriteAllLines($outputFilePath, $outputLines)
+        Start-Process $outputFilePath
         $statusLabel.Text = "Output saved to: $outputFilePath"
     } else { $statusLabel.Text = "Operation cancelled." }
 })
